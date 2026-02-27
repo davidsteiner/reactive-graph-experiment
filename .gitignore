@@ -1,0 +1,9 @@
+/target
+/.idea
+/docs
+**/.DS_Store
+*.db
+/data/*
+flamegraph.svg
+tracing*
+lcov.info
