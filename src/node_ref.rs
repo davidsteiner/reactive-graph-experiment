@@ -2,6 +2,7 @@ use std::any::TypeId;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 /// Unique identity for a node in the graph.
 /// TypeId scopes keys by concrete node type so different node types never collide.
@@ -9,7 +10,7 @@ use std::marker::PhantomData;
 pub struct NodeId {
     pub(crate) type_id: TypeId,
     pub(crate) key_hash: u64,
-    pub(crate) key_debug: String,
+    pub(crate) key_debug: Arc<str>,
 }
 
 impl fmt::Debug for NodeId {
@@ -43,7 +44,7 @@ impl NodeId {
         NodeId {
             type_id: TypeId::of::<Scope>(),
             key_hash,
-            key_debug: format!("{:?}", key),
+            key_debug: Arc::from(format!("{:?}", key)),
         }
     }
 }
@@ -64,7 +65,7 @@ impl<T> Clone for NodeRef<T> {
     }
 }
 
-// NodeRef is not Copy because NodeId contains String.
+// NodeRef is not Copy because NodeId contains Arc<str>.
 // It is Clone, Send, and Sync.
 
 impl<T> fmt::Debug for NodeRef<T> {
