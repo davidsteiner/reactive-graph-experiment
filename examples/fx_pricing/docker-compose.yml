@@ -11,6 +11,7 @@ services:
     build:
       context: ../..
       dockerfile: examples/fx_pricing/Dockerfile
+    tty: true
     environment:
       REDIS_URL: redis://valkey:6379
       BIND_ADDR: 0.0.0.0:3000

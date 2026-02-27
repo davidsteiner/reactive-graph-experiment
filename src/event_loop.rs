@@ -19,6 +19,25 @@ pub fn start_engine() -> (EngineHandle, std::thread::JoinHandle<()>) {
 
 fn run_event_loop(cmd_rx: mpsc::Receiver<Command>, cmd_tx: mpsc::Sender<Command>) {
     let mut engine = Engine::new();
+
+    // Interpose a bridge between source Senders and the graph's internal channel.
+    // Sources call Sender::send() which writes to graph.source_tx. Without this
+    // bridge, those values sit in source_rx unprocessed because the event loop
+    // blocks on cmd_rx. The bridge forwards each value AND sends a SourceReady
+    // notification on the command channel so the event loop wakes up.
+    let (bridge_tx, bridge_rx) = mpsc::channel();
+    let source_tx = std::mem::replace(&mut engine.graph.source_tx, bridge_tx);
+    {
+        let fwd = source_tx.clone();
+        let notify = cmd_tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(msg) = bridge_rx.recv() {
+                let _ = fwd.send(msg);
+                let _ = notify.send(Command::SourceReady);
+            }
+        });
+    }
+
     engine.async_manager.set_notifier(cmd_tx);
 
     loop {
@@ -40,9 +59,12 @@ fn run_event_loop(cmd_rx: mpsc::Receiver<Command>, cmd_tx: mpsc::Sender<Command>
         for cmd in commands {
             match cmd {
                 Command::SourceUpdate { id, value } => {
-                    // Feed into the engine's internal source channel.
-                    // run_cycle() will drain these into the value store.
-                    let _ = engine.graph.source_tx.send((id, value));
+                    // Direct send bypassing the bridge (we're already in the
+                    // event loop so no wake-up is needed).
+                    let _ = source_tx.send((id, value));
+                    has_updates = true;
+                }
+                Command::SourceReady => {
                     has_updates = true;
                 }
                 Command::Merge { subgraph, reply } => {

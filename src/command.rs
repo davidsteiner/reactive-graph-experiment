@@ -20,6 +20,8 @@ pub enum Command {
     Remove { node_ids: Vec<NodeId> },
     /// Notification that an async computation completed (wake event loop).
     AsyncComplete,
+    /// Notification that a source value arrived (wake event loop).
+    SourceReady,
     /// Shut down the event loop.
     Shutdown,
 }
