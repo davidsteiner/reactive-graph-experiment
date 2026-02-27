@@ -1,0 +1,41 @@
+services:
+  valkey:
+    image: valkey/valkey:8-alpine
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  fx-pricing:
+    build:
+      context: ../..
+      dockerfile: examples/fx_pricing/Dockerfile
+    environment:
+      REDIS_URL: redis://valkey:6379
+      BIND_ADDR: 0.0.0.0:3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      valkey:
+        condition: service_healthy
+
+  price-feed:
+    image: valkey/valkey:8-alpine
+    entrypoint: ["sh", "/scripts/price-feed.sh"]
+    volumes:
+      - ./price-feed.sh:/scripts/price-feed.sh:ro
+    environment:
+      REDIS_HOST: valkey
+      REDIS_PORT: "6379"
+    depends_on:
+      valkey:
+        condition: service_healthy
+
+  seed-trades:
+    image: curlimages/curl:latest
+    entrypoint: ["/bin/sh", "/scripts/seed-trades.sh"]
+    volumes:
+      - ./seed-trades.sh:/scripts/seed-trades.sh:ro
+    depends_on:
+      - fx-pricing
