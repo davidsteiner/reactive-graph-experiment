@@ -160,3 +160,28 @@ When a source re-establishes its value after a restart, it is treated as a regul
 
 ### Observability
 The framework must provide visibility into which sources are in the "no value yet" state and which subgraphs are blocked as a result. Without this, a missing Redis key becomes a silent mystery.
+
+## Graph Partitioning and Node Deduplication
+
+### Current single-engine model
+Subgraphs are built independently and merged into one engine. Nodes with the same identity (`NodeId` = type + key hash) are automatically deduplicated via ref-counting. Dropping a `SubgraphHandle` only removes nodes whose ref-count reaches zero. This means users can independently declare "I need spot EURUSD" without knowing whether it already exists.
+
+### Partitioning model
+The framework does **not** impose a fixed topology (e.g., "core" vs "workers"). Any node can live in any subgraph, and subgraphs are the unit of distribution — each subgraph is assigned to an engine instance. How subgraphs are mapped to machines is a deployment decision made via a pluggable `AssignmentStrategy`, not a framework concern.
+
+### Distributed deduplication
+The deduplication property is preserved across the cluster:
+
+1. Users build `Subgraph` instances exactly as they do today — no awareness of distribution
+2. On merge, the framework (via the coordinator) checks which nodes already exist somewhere in the cluster, using the same `NodeId` identity (type + key hash)
+3. Nodes that already exist on another engine → replaced with **mirror sources** on the target engine that receive values over the network
+4. Nodes that are new → registered on the target engine
+5. Ref-counting extends cluster-wide — the coordinator tracks which engines reference each node
+
+The `NodeId` scheme is content-addressable (type + key), so two engines independently creating `NodeId::from_key::<SpotRate>("EURUSD")` produce the same ID. The coordinator detects the overlap automatically.
+
+### User experience
+The quant's code is identical to the single-engine case. They build subgraphs, declare dependencies, and merge. The framework decides where each node runs and wires up mirror sources for cross-engine edges. Deduplication is invisible and automatic.
+
+### Engine instances
+Each engine instance (regardless of where it runs) is a full engine with its own `Graph`, `ValueStore`, and scheduler. It deduplicates within itself exactly as today. Mirror sources are just regular sources from the engine's perspective — they receive values from the network instead of from external data.
