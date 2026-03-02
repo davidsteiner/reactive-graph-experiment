@@ -1,12 +1,49 @@
 # Distributed Framework - Long Term Vision
 
-## Serialization Strategy
+## Architecture: Central Graph with Remote Workers
 
-### Two-path model
-- **Same engine**: direct memory access, zero cost — no serialization within a single engine instance
-- **Remote partition**: serialize only at network partition boundaries
+### Overview
+The graph runs on a single machine — topology, scheduling, value store, deduplication, backward activation — all unchanged from the single-engine model. The only thing that changes is **where computation happens**. Expensive compute nodes can be offloaded to a pool of stateless workers over the network.
 
-### NodeValue trait over blanket serde bounds
+Workers are dumb executors. They receive serialized inputs, run a compute function, and return the serialized result. They have no concept of the graph, dependencies, epochs, or other nodes.
+
+### How it works
+1. The engine runs its wave-based scheduler as normal
+2. Within a wave, nodes marked for remote execution have their inputs serialized and sent to an available worker
+3. The worker looks up the compute function in a type registry, runs it, returns the result
+4. The engine deserializes the result and stores it in the value store like any other node
+5. The engine proceeds to the next wave
+
+This is the existing parallel scheduler model, with network calls instead of thread spawns.
+
+### What stays unchanged
+Everything that makes the framework valuable works exactly as it does today:
+- Dependency tracking and dirty propagation
+- Automatic deduplication of shared nodes via ref-counting
+- Backward activation on subgraph merge
+- Subgraph lifecycle (SubgraphHandle RAII, ref-count-based cleanup)
+- Source collapsing (multiple ticks between cycles naturally merge)
+- Error strategies
+
+### What this avoids
+Compared to a fully distributed graph:
+- No coordinator process
+- No mirror source nodes
+- No distributed deduplication or cluster-wide ref-counting
+- No epoch alignment protocol
+- No distributed scheduling or cross-partition barriers
+
+### Limitations
+- **Central machine is a bottleneck** — all values flow through it. In practice this is acceptable because the central machine orchestrates and stores values but doesn't do heavy computation.
+- **Network round-trip per wave** — the engine sends inputs to workers and waits for results before proceeding. With shallow graphs (3-4 levels) this is 3-4 round-trips per cycle, negligible on a local network.
+- **Memory** — the value store holds everything centrally. Acceptable for typical use cases (pricing results are small), could become a constraint at extreme scale.
+
+### Evolution path
+This architecture doesn't close the door on full distribution. The serialization layer (NodeValue trait, type registry) carries over directly. If the central machine becomes a bottleneck, specific parts of the graph can be promoted to independent engines — but only when there's evidence that it's needed.
+
+## Serialization
+
+### NodeValue trait
 A `NodeValue` trait lets each type choose its optimal encoding rather than forcing `Serialize + Deserialize` on everything:
 
 ```rust
@@ -22,48 +59,95 @@ A blanket impl covers serde-compatible types with bincode as the default. Types 
 - **bincode** for small typed values (prices, structs) — fastest, minimal overhead, Rust-to-Rust
 - **Arrow IPC** for columnar data (Polars DataFrames) — near-zero-cost serialization since Polars is Arrow-backed internally; the receiver can use buffers directly without a deserialization pass
 
-### Type dispatch over the wire
-Tagged envelope with a type registry:
+### Two-path optimisation
+- **Local nodes**: direct memory access, zero cost — no serialization
+- **Remote nodes**: serialize inputs, send to worker, deserialize result
+
+The engine knows which nodes are local and which are remote, so serialization only happens when necessary.
+
+### Type registry on workers
+Workers need to instantiate compute functions from a type tag:
 
 ```rust
-struct WireMessage {
-    epoch: u64,
-    node_id: NodeId,
-    type_tag: u32,
-    payload: Bytes,
+type ComputeFn = fn(&[u8]) -> Vec<u8>; // deserialize inputs, compute, serialize output
+
+struct WorkerRegistry {
+    functions: HashMap<u32, ComputeFn>,
 }
 ```
 
-Type registry maps tags to deserialization functions, registered at startup. This is the distributed equivalent of the current `TypeId`-based `downcast_ref` dispatch.
+Registered at worker startup. The engine and workers must agree on type tags — these are part of the deployment configuration.
 
-## Scaling Model
+## Workers
 
-### Target use case
-The primary use case is FX/derivatives pricing: market data sources feed shared intermediate calculations (interpolated curves, derived rates), which fan out to potentially thousands of independent trade-specific pricing nodes. The graph is shallow (3-4 levels) but wide at the leaf levels.
+### Stateless design
+Workers hold no graph state. They are a pool of compute resources:
+- Receive: `(type_tag, serialized_inputs)`
+- Execute: look up compute function, deserialize inputs, run, serialize output
+- Return: `serialized_output`
 
-### Architecture: shared core + worker pool
-- **Shared core**: market data sources and shared intermediate nodes (e.g., vol surfaces, discount curves). Runs on a single engine or small HA cluster. Small, fast, everything depends on it.
-- **Worker pool**: each worker takes a slice of the trade population. Workers subscribe to boundary values from the core. When market data updates propagate through the core, boundary values are pushed to workers, and each worker runs its local levels independently.
-- Workers **do not coordinate with each other** — they are independent consumers of the core's outputs. Adding a worker just means assigning trades to it.
+Workers can be restarted, replaced, or scaled without any impact on the graph.
 
-### Scaling characteristics
-- **Horizontal scaling within a level**: the main scaling axis. Thousands of independent pricing nodes spread across workers, scales linearly with machines.
-- **Pipeline parallelism**: the core can work on epoch N+1 while workers finish epoch N. Improves throughput.
-- **Cross-partition barrier cost is negligible** with only 3-4 levels — a few network round-trips per cycle.
+### Autoscaling
 
-### Trade assignment
-How trades are distributed across workers is a deployment/business decision: round-robin, by currency pair (to share intermediate calcs locally), by desk, etc. Configured by the platform team, not by quants.
+#### Principle: framework handles lifecycle, infrastructure handles scaling decisions
+The framework does **not** own autoscaling. Infrastructure orchestrators (Kubernetes HPA, ECS autoscaling) already solve this well.
+
+#### Responsibility boundary
+
+| Concern | Owner |
+|---|---|
+| How many workers should be running | Infrastructure (K8s/ECS) |
+| When to add/remove instances | Infrastructure (based on metrics the framework exposes) |
+| What happens when a worker joins | Framework (adds to pool, starts sending work) |
+| What happens when a worker leaves | Framework (removes from pool, redistributes in-flight work) |
+| Health/readiness signals | Framework exposes, infrastructure consumes |
+
+#### Metrics the framework exposes
+Custom metrics for infrastructure to scale on (richer than raw CPU):
+- Worker utilisation (busy vs idle)
+- Propagation cycle latency
+- Remote compute queue depth
+- Serialization overhead
+
+### Worker failure
+If a worker dies mid-computation, the engine detects the failure (connection drop / timeout) and resubmits the work to another available worker. The graph doesn't need to know — it's just waiting for a result. Retrying on a different worker is transparent.
+
+## Consistency and Backpressure
+
+### No distributed consistency problem
+Because the graph runs on a single engine, consistency is free — exactly as it is today. A propagation cycle is synchronous within the engine. Every node in a wave sees values from the same cycle. Remote execution doesn't change this: the engine sends inputs and waits for results within the same cycle.
+
+### Backpressure via source collapsing
+Backpressure is handled by the existing source collapsing mechanism. If multiple market data ticks arrive while the engine is mid-cycle, sources store the latest value. The next cycle picks up whatever is current. Intermediate ticks are naturally collapsed. No epochs, no skipping protocol, no coordination needed.
+
+## State Recovery
+
+### Principle: sources own their recovery
+The framework does not checkpoint or replay values. Each source is responsible for re-establishing its own state on restart.
+
+### Three source states
+- **Has a value** — normal, propagate downstream
+- **No value yet** — source is activated but hasn't received data. Downstream nodes wait. Not an error.
+- **Error** — source failed (e.g., connection lost, bad data). Error strategy applies.
+
+The "no value yet" state is intentional and useful beyond recovery — e.g., a new data feed that hasn't produced its first value yet. The subgraph stays dormant until the first value arrives, then lights up naturally.
+
+### Recovery is a normal update
+When a source re-establishes its value after a restart, it is treated as a regular value update — the source sets its value, dependants are marked dirty, and the next propagation cycle runs. No special recovery mode.
+
+### Observability
+The framework must provide visibility into which sources are in the "no value yet" state and which subgraphs are blocked as a result.
 
 ## Developer Experience
 
 ### Design principle
-Distribution should be invisible to the end users of the framework (quants). They think in terms of computation — "this trade depends on spot, vol surface, and discount curve" — and the framework handles placement, serialization, and coordination.
+Distribution should be invisible to end users of the framework. They think in terms of computation and dependencies. The framework handles where computation runs.
 
-### Quant-facing API
-Looks identical to the single-engine API:
+### User-facing API
+Identical to the single-engine API. The only concession is `Serialize + Deserialize` on types that may be computed remotely:
 
 ```rust
-// Quant writes this — no awareness of distribution
 #[derive(Serialize, Deserialize)]
 struct VanillaOptionPricer {
     strike: f64,
@@ -79,7 +163,7 @@ impl Compute for VanillaOptionPricer {
     }
 }
 
-// Registration — also no distribution awareness
+// Registration — no awareness of distribution
 graph.compute("trade-12345")
     .dep(&spot_eurusd)
     .dep(&vol_surface_eurusd)
@@ -87,131 +171,25 @@ graph.compute("trade-12345")
     .node(VanillaOptionPricer { strike: 1.05, expiry: date });
 ```
 
-The quant's only concession to distribution is `Serialize + Deserialize` on their types — which they'd want anyway for persistence and reporting.
-
 ### Infrastructure-facing API
-Separate layer configured by the platform team:
+Separate layer for configuring remote execution:
 
 ```rust
-let cluster = ClusterConfig::new()
-    .core(CoreConfig::new().sources(&market_data_feeds))
+let engine = Engine::builder()
     .worker_pool(WorkerPoolConfig::new()
         .min_workers(4)
-        .assignment(AssignmentStrategy::ByCurrencyPair))
+        .connect("worker-pool.internal:9000"))
+    .remote_execution(|node| {
+        // Decide which nodes run remotely
+        // e.g., by node kind, by estimated cost, by annotation
+        node.kind() == NodeKind::Compute && node.deps().len() > 2
+    })
     .build();
 ```
 
-### Automatic placement from dependency declarations
-The dependency declarations already contain all the information the framework needs:
-- `.dep(&spot_eurusd)` tells the framework this trade needs that value, which lives in the core
-- Leaf-level compute nodes with no dependants → assigned to workers
-- Nodes with many dependants across trades → stay in the core
-- The serialization boundary emerges naturally from the graph topology
-
-`NodeRef<T>` works transparently regardless of whether the dependency is local or remote.
-
-### Backward activation
-When a new trade is added to a worker, the worker tells the core "I need these intermediate nodes active." The core does its local backward activation to sources. The worker doesn't need to know anything about the core's internal topology.
-
-## Autoscaling
-
-### Principle: framework handles lifecycle, infrastructure handles scaling decisions
-The framework does **not** own autoscaling. Infrastructure orchestrators (Kubernetes HPA, ECS autoscaling) already solve this well. The framework's responsibility is handling the **consequences** of scaling — workers appearing and disappearing gracefully.
-
-### Responsibility boundary
-
-| Concern | Owner |
-|---|---|
-| How many workers should be running | Infrastructure (K8s/ECS) |
-| When to add/remove instances | Infrastructure (based on metrics the framework exposes) |
-| What happens when a worker joins | Framework (registration, trade assignment, activation) |
-| What happens when a worker leaves | Framework (trade redistribution, cleanup) |
-| Health/readiness signals | Framework exposes, infrastructure consumes |
-
-### Worker lifecycle
-
-- **Registration**: new worker connects to the core, announces itself, gets assigned a slice of trades. The core pushes boundary values and the worker builds its local graph.
-- **Deregistration**: worker signals the core it is shutting down (scale-down or rolling deploy). Its trades are redistributed to remaining workers before it exits.
-- **Failure**: worker disappears without warning. The core detects this via heartbeat timeout and reassigns its trades to surviving workers.
-
-### Readiness
-Trade reassignment has a warm-up cost — boundary values must be pushed from the core, the local graph built, and a full propagation cycle completed. The framework exposes a **readiness probe** ("has this worker completed its first propagation cycle") so infrastructure doesn't route work to it prematurely.
-
-### Metrics the framework exposes
-Custom metrics for infrastructure to scale on (richer than raw CPU):
-- Trades per worker
-- Propagation cycle latency
-- Worker queue depth
-
-## State Recovery
-
-### Principle: sources own their recovery
-The framework does not checkpoint or replay values. Each source is responsible for re-establishing its own state on restart. For the primary use case, this means Redis key-value cache for cold start with pub/sub for live updates thereafter.
-
-### Three source states
-- **Has a value** — normal, propagate downstream
-- **No value yet** — source is activated but hasn't received data. Downstream nodes wait. Not an error.
-- **Error** — source failed (e.g., Redis connection lost, bad data). Error strategy applies.
-
-The "no value yet" state is intentional and useful beyond recovery — e.g., a new currency pair being onboarded where the feed hasn't produced its first tick yet. The subgraph stays dormant until the first value arrives, then lights up naturally.
-
-### Recovery is a normal update
-When a source re-establishes its value after a restart, it is treated as a regular value update — the source sets its value, dependants are marked dirty, and the next propagation cycle runs. No special recovery mode exists. The framework doesn't need to know it was a restart.
-
-### Observability
-The framework must provide visibility into which sources are in the "no value yet" state and which subgraphs are blocked as a result. Without this, a missing Redis key becomes a silent mystery.
-
-## Graph Partitioning and Node Deduplication
-
-### Current single-engine model
-Subgraphs are built independently and merged into one engine. Nodes with the same identity (`NodeId` = type + key hash) are automatically deduplicated via ref-counting. Dropping a `SubgraphHandle` only removes nodes whose ref-count reaches zero. This means users can independently declare "I need spot EURUSD" without knowing whether it already exists.
-
-### Partitioning model
-The framework does **not** impose a fixed topology (e.g., "core" vs "workers"). Any node can live in any subgraph, and subgraphs are the unit of distribution — each subgraph is assigned to an engine instance. How subgraphs are mapped to machines is a deployment decision made via a pluggable `AssignmentStrategy`, not a framework concern.
-
-### Distributed deduplication
-The deduplication property is preserved across the cluster:
-
-1. Users build `Subgraph` instances exactly as they do today — no awareness of distribution
-2. On merge, the framework (via the coordinator) checks which nodes already exist somewhere in the cluster, using the same `NodeId` identity (type + key hash)
-3. Nodes that already exist on another engine → replaced with **mirror sources** on the target engine that receive values over the network
-4. Nodes that are new → registered on the target engine
-5. Ref-counting extends cluster-wide — the coordinator tracks which engines reference each node
-
-The `NodeId` scheme is content-addressable (type + key), so two engines independently creating `NodeId::from_key::<SpotRate>("EURUSD")` produce the same ID. The coordinator detects the overlap automatically.
-
-### User experience
-The quant's code is identical to the single-engine case. They build subgraphs, declare dependencies, and merge. The framework decides where each node runs and wires up mirror sources for cross-engine edges. Deduplication is invisible and automatic.
-
-### Engine instances
-Each engine instance (regardless of where it runs) is a full engine with its own `Graph`, `ValueStore`, and scheduler. It deduplicates within itself exactly as today. Mirror sources are just regular sources from the engine's perspective — they receive values from the network instead of from external data.
-
-## Consistency, Ordering, and Backpressure
-
-### Problem
-In a single engine, consistency is free — a propagation cycle is synchronous and every node sees values from the same cycle. Distributed, engines run at different speeds, and a receiving engine may depend on boundary values from multiple upstream engines. Without coordination, it could see epoch 5's spot rate with epoch 4's vol surface.
-
-### Global epoch alignment
-The cluster uses a global monotonic epoch to ensure all engines see a consistent world:
-
-1. **Coordinator assigns epochs** — when source values change, the coordinator increments the global epoch and notifies the relevant engine to propagate
-2. **Engines tag boundary outputs with the epoch** — engine A finishes epoch 7, publishes its boundary values tagged as epoch 7
-3. **Receiving engines collect from all upstream engines** — engine B depends on boundary values from engines A and C. It waits until it has a bundle from both for the same epoch (or later)
-4. **Atomic application** — once a complete consistent set is assembled, the engine applies all boundary values to its mirror sources atomically and runs its local propagation cycle
-
-### Backpressure: latest-wins with epoch skipping
-No engine ever blocks an upstream engine. The producing engine publishes and moves on.
-
-- If engine B is slow and epoch 8 arrives from all its upstream engines before B finished processing epoch 7, B **skips epoch 7** and applies epoch 8
-- The invariant is: all boundary values applied in a single cycle come from the **same epoch**
-- This mirrors the existing `LatestWins` async policy — intermediate states are skipped, only the latest consistent snapshot matters
-- Implementation is essentially a single-slot channel per boundary: new bundles overwrite previous unprocessed ones
-
-### Selective notification
-Not every epoch affects every engine. If epoch 8 was triggered by a JPY rate change, engines with no JPY-related boundary inputs don't need to act. The coordinator can notify only engines whose boundary inputs actually changed, or engines can short-circuit locally by checking whether any mirror source values actually differ.
-
-### What this avoids
-- **No lock-step synchronization** — the slowest engine doesn't bottleneck the cluster
-- **No unbounded queues** — at most one pending bundle per upstream engine
-- **No backpressure protocol** — producers never block or slow down
-- **No inconsistent snapshots** — epoch alignment guarantees a coherent world view
+### What users don't need to think about
+- Which machine runs their computation
+- Serialization (derives are the only requirement)
+- Worker pool sizing (infrastructure handles this)
+- Failure handling (transparent retry)
+- Consistency (single engine guarantees it)
