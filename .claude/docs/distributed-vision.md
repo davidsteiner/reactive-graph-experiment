@@ -142,3 +142,21 @@ Custom metrics for infrastructure to scale on (richer than raw CPU):
 - Trades per worker
 - Propagation cycle latency
 - Worker queue depth
+
+## State Recovery
+
+### Principle: sources own their recovery
+The framework does not checkpoint or replay values. Each source is responsible for re-establishing its own state on restart. For the primary use case, this means Redis key-value cache for cold start with pub/sub for live updates thereafter.
+
+### Three source states
+- **Has a value** — normal, propagate downstream
+- **No value yet** — source is activated but hasn't received data. Downstream nodes wait. Not an error.
+- **Error** — source failed (e.g., Redis connection lost, bad data). Error strategy applies.
+
+The "no value yet" state is intentional and useful beyond recovery — e.g., a new currency pair being onboarded where the feed hasn't produced its first tick yet. The subgraph stays dormant until the first value arrives, then lights up naturally.
+
+### Recovery is a normal update
+When a source re-establishes its value after a restart, it is treated as a regular value update — the source sets its value, dependants are marked dirty, and the next propagation cycle runs. No special recovery mode exists. The framework doesn't need to know it was a restart.
+
+### Observability
+The framework must provide visibility into which sources are in the "no value yet" state and which subgraphs are blocked as a result. Without this, a missing Redis key becomes a silent mystery.
