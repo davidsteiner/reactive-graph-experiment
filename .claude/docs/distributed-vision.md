@@ -185,3 +185,33 @@ The quant's code is identical to the single-engine case. They build subgraphs, d
 
 ### Engine instances
 Each engine instance (regardless of where it runs) is a full engine with its own `Graph`, `ValueStore`, and scheduler. It deduplicates within itself exactly as today. Mirror sources are just regular sources from the engine's perspective — they receive values from the network instead of from external data.
+
+## Consistency, Ordering, and Backpressure
+
+### Problem
+In a single engine, consistency is free — a propagation cycle is synchronous and every node sees values from the same cycle. Distributed, engines run at different speeds, and a receiving engine may depend on boundary values from multiple upstream engines. Without coordination, it could see epoch 5's spot rate with epoch 4's vol surface.
+
+### Global epoch alignment
+The cluster uses a global monotonic epoch to ensure all engines see a consistent world:
+
+1. **Coordinator assigns epochs** — when source values change, the coordinator increments the global epoch and notifies the relevant engine to propagate
+2. **Engines tag boundary outputs with the epoch** — engine A finishes epoch 7, publishes its boundary values tagged as epoch 7
+3. **Receiving engines collect from all upstream engines** — engine B depends on boundary values from engines A and C. It waits until it has a bundle from both for the same epoch (or later)
+4. **Atomic application** — once a complete consistent set is assembled, the engine applies all boundary values to its mirror sources atomically and runs its local propagation cycle
+
+### Backpressure: latest-wins with epoch skipping
+No engine ever blocks an upstream engine. The producing engine publishes and moves on.
+
+- If engine B is slow and epoch 8 arrives from all its upstream engines before B finished processing epoch 7, B **skips epoch 7** and applies epoch 8
+- The invariant is: all boundary values applied in a single cycle come from the **same epoch**
+- This mirrors the existing `LatestWins` async policy — intermediate states are skipped, only the latest consistent snapshot matters
+- Implementation is essentially a single-slot channel per boundary: new bundles overwrite previous unprocessed ones
+
+### Selective notification
+Not every epoch affects every engine. If epoch 8 was triggered by a JPY rate change, engines with no JPY-related boundary inputs don't need to act. The coordinator can notify only engines whose boundary inputs actually changed, or engines can short-circuit locally by checking whether any mirror source values actually differ.
+
+### What this avoids
+- **No lock-step synchronization** — the slowest engine doesn't bottleneck the cluster
+- **No unbounded queues** — at most one pending bundle per upstream engine
+- **No backpressure protocol** — producers never block or slow down
+- **No inconsistent snapshots** — epoch alignment guarantees a coherent world view
